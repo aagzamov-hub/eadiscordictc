@@ -1,0 +1,37 @@
+# Platform.sh / Upsun configuration (for the move to company hosting).
+# Starting point only — have the Platform.sh admins confirm the runtime version, plan sizes and service names.
+applications:
+  ea-discord:
+    type: "nodejs:22"
+    source:
+      root: "/"
+    build:
+      flavor: none
+    hooks:
+      build: |
+        set -e
+        npm ci
+        npm run build
+        npm prune --omit=dev
+    relationships:
+      database: "db:postgresql"
+    web:
+      commands:
+        start: "node dist/index.js"
+      locations:
+        "/":
+          passthru: true
+    # DATABASE_URL is derived from the "database" relationship at startup (src/config.ts).
+    # Set DISCORD_TOKEN, MCP_API_KEY etc. as sensitive project variables prefixed with env:.
+    variables:
+      env:
+        NODE_ENV: production
+
+services:
+  db:
+    type: "postgresql:16"
+
+routes:
+  "https://{default}/":
+    type: upstream
+    upstream: "ea-discord:http"
