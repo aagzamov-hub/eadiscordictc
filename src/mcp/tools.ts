@@ -173,15 +173,32 @@ export function buildMcpServer(deps: ToolDeps): McpServer {
 
   tool(
     "create_channel",
-    "Create a text channel, announcement channel, or category.",
+    "Create a text channel, announcement channel, or category. private=true hides it from everyone except the bot " +
+      "and the listed roles/users (e.g. a facilitators-only channel). Server owners and admins can always see it.",
     {
       guild_id: id,
       name: z.string().min(1).max(100),
       kind: z.enum(["text", "announcement", "category"]).optional(),
       category_id: id.optional(),
       topic: z.string().max(1024).optional(),
+      private: z.boolean().optional(),
+      allow_role_ids: idList.optional(),
+      allow_user_ids: idList.optional(),
     },
     (a) => d.createChannel(ctx, a.guild_id, a.name, a),
+  );
+
+  tool(
+    "create_role",
+    "Create a role with no extra permissions (e.g. a cohort or facilitator label). It is placed below the bot's role.",
+    {
+      guild_id: id,
+      name: z.string().min(1).max(100),
+      color: z.string().regex(/^#?[0-9a-fA-F]{6}$/).optional().describe("hex, e.g. #3498db"),
+      mentionable: z.boolean().optional(),
+      hoist: z.boolean().optional().describe("show members separately in the member list"),
+    },
+    (a) => d.createRole(ctx, a.guild_id, a.name, a),
   );
 
   tool(

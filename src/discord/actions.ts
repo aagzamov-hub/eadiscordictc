@@ -1,5 +1,6 @@
 import {
   ChannelType,
+  PermissionFlagsBits,
   type Client,
   type Guild,
   type GuildBasedChannel,
@@ -242,7 +243,14 @@ export async function createChannel(
   ctx: DiscordCtx,
   guildId: string,
   name: string,
-  opts: { category_id?: string; topic?: string; kind?: "text" | "announcement" | "category" },
+  opts: {
+    category_id?: string;
+    topic?: string;
+    kind?: "text" | "announcement" | "category";
+    private?: boolean;
+    allow_role_ids?: string[];
+    allow_user_ids?: string[];
+  },
 ) {
   const guild = await getGuild(ctx, guildId);
   const type =
@@ -251,8 +259,41 @@ export async function createChannel(
       : opts.kind === "announcement"
         ? ChannelType.GuildAnnouncement
         : ChannelType.GuildText;
-  const ch = await guild.channels.create({ name, type, parent: opts.category_id, topic: opts.topic } as any);
-  return { id: ch.id, name: ch.name };
+  // Private: hidden from @everyone; visible to the bot plus the listed roles/users.
+  const see = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory];
+  const permissionOverwrites = opts.private
+    ? [
+        { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+        { id: ctx.client.user!.id, allow: see },
+        ...(opts.allow_role_ids ?? []).map((id) => ({ id, allow: see })),
+        ...(opts.allow_user_ids ?? []).map((id) => ({ id, allow: see })),
+      ]
+    : undefined;
+  const ch = await guild.channels.create({
+    name,
+    type,
+    parent: opts.category_id,
+    topic: opts.topic,
+    permissionOverwrites,
+  } as any);
+  return { id: ch.id, name: ch.name, private: !!opts.private };
+}
+
+export async function createRole(
+  ctx: DiscordCtx,
+  guildId: string,
+  name: string,
+  opts: { color?: string; mentionable?: boolean; hoist?: boolean },
+) {
+  const guild = await getGuild(ctx, guildId);
+  const role = await guild.roles.create({
+    name,
+    color: opts.color ? (parseInt(opts.color.replace("#", ""), 16) as any) : undefined,
+    mentionable: opts.mentionable ?? false,
+    hoist: opts.hoist ?? false,
+    permissions: [], // cohort/facilitator roles are labels; channel access comes from channel permissions
+  });
+  return { id: role.id, name: role.name };
 }
 
 export async function sendDm(ctx: DiscordCtx, userId: string, content: string) {
