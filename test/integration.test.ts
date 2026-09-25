@@ -14,6 +14,7 @@ import { buildMcpServer } from "../src/mcp/tools.js";
 import { runDueMessages } from "../src/scheduler/runner.js";
 import { createTriage } from "../src/triage/pipeline.js";
 import type { DiscordCtx } from "../src/discord/actions.js";
+import { WrikeClient } from "../src/integrations/wrike.js";
 
 const DB_URL = process.env.TEST_DATABASE_URL;
 const KEY = "k".repeat(40);
@@ -163,7 +164,14 @@ describe.skipIf(!DB_URL)("integration", () => {
   });
 
   it("stores cohorts with partial updates", async () => {
-    await call("upsert_cohort", { name: "Cohort 1", channel_ids: ["100100"], alert_channel_id: "300300", facilitator_user_ids: ["400400"] });
+    await call("upsert_cohort", {
+      name: "Cohort 1",
+      channel_ids: ["100100"],
+      alert_channel_id: "300300",
+      facilitator_user_ids: ["400400"],
+      wrike_folder_id: "IEABFOLDER",
+      wrike_assignee_ids: ["KUAFAC"],
+    });
     const upd = await call("upsert_cohort", { name: "Cohort 1", category_ids: ["900900"] });
     expect(upd.data.channel_ids).toEqual(["100100"]);
     expect(upd.data.category_ids).toEqual(["900900"]);
@@ -171,9 +179,15 @@ describe.skipIf(!DB_URL)("integration", () => {
   });
 
   it("triages a message end to end: classify → route → store → alert", async () => {
+    const wrikeCalls: URL[] = [];
+    const wrike = new WrikeClient({ token: "t", host: "www.wrike.com" }, (async (url: URL) => {
+      wrikeCalls.push(url);
+      return new Response(JSON.stringify({ data: [{ id: "IEABTASK1", permalink: "https://www.wrike.com/open.htm?id=9" }] }));
+    }) as unknown as typeof fetch);
     const triage = createTriage({
       db,
       ctx,
+      wrike,
       classify: async (input) =>
         input.content.includes("idiot")
           ? { category: "abusive", severity: "high", needs_human: true, summary: "Insult aimed at a peer." }
@@ -201,7 +215,15 @@ describe.skipIf(!DB_URL)("integration", () => {
 
     const events = await call("list_triage_events", { cohort: "Cohort 1", min_severity: "medium" });
     expect(events.data).toHaveLength(1);
-    expect(events.data[0]).toMatchObject({ category: "abusive", severity: "high", cohort: "Cohort 1", alerted: true });
+    expect(events.data[0]).toMatchObject({
+      category: "abusive",
+      severity: "high",
+      cohort: "Cohort 1",
+      alerted: true,
+      ticket_id: "IEABTASK1",
+      ticket_url: "https://www.wrike.com/open.htm?id=9",
+    });
+    expect(wrikeCalls.map((u) => u.pathname)).toEqual(["/api/v4/folders/IEABFOLDER/tasks"]);
 
     const alerts = sent.slice(before);
     expect(alerts.map((a) => a.channel).sort()).toEqual(["300300", "dm:400400"]); // alert channel + facilitator DM

@@ -4,7 +4,7 @@ import { firstRun, nextCronRun, ScheduleError } from "../src/scheduler/schedule.
 import { matchCohort, type CohortRow } from "../src/triage/routing.js";
 import { loadConfig, platformDatabaseUrl } from "../src/config.js";
 import { keyMatches } from "../src/http.js";
-import { plannerPriority } from "../src/integrations/planner.js";
+import { WrikeClient, wrikeImportance } from "../src/integrations/wrike.js";
 
 describe("prefilter", () => {
   it("skips chatter, emoji and bare links", () => {
@@ -51,7 +51,7 @@ describe("schedule", () => {
 });
 
 describe("cohort routing", () => {
-  const base = { facilitator_user_ids: [], alert_channel_id: null, planner_plan_id: null, planner_bucket_id: null, planner_assignee_ids: [] };
+  const base = { facilitator_user_ids: [], alert_channel_id: null, wrike_folder_id: null, wrike_assignee_ids: [] };
   const cohorts: CohortRow[] = [
     { ...base, id: "1", name: "C1", channel_ids: ["100"], category_ids: [], role_ids: ["r1"] },
     { ...base, id: "2", name: "C2", channel_ids: [], category_ids: ["900"], role_ids: [] },
@@ -73,10 +73,10 @@ describe("config", () => {
     expect(c.TRIAGE_ENABLED).toBe(false);
     expect(c.DEFAULT_TIMEZONE).toBe("America/Toronto");
   });
-  it("rejects short keys and incomplete triage/planner setups", () => {
+  it("rejects short keys and incomplete triage/wrike setups", () => {
     expect(() => loadConfig({ ...good, MCP_API_KEY: "short" })).toThrow(/MCP_API_KEY/);
     expect(() => loadConfig({ ...good, TRIAGE_ENABLED: "true" })).toThrow(/ANTHROPIC_API_KEY/);
-    expect(() => loadConfig({ ...good, PLANNER_ENABLED: "true" })).toThrow(/MS_TENANT_ID/);
+    expect(() => loadConfig({ ...good, WRIKE_ENABLED: "true" })).toThrow(/WRIKE_ACCESS_TOKEN/);
   });
   it("derives DATABASE_URL on Platform.sh", () => {
     const rels = { database: [{ username: "main", password: "p@ss", host: "db.internal", port: 5432, path: "main" }] };
@@ -93,8 +93,51 @@ describe("misc", () => {
     expect(keyMatches("ab", "abc")).toBe(false);
     expect(keyMatches(undefined, "abc")).toBe(false);
   });
-  it("maps severity to Planner priority", () => {
-    expect(plannerPriority("critical")).toBe(1);
-    expect(plannerPriority("low")).toBe(9);
+  it("maps severity to Wrike importance", () => {
+    expect(wrikeImportance("critical")).toBe("High");
+    expect(wrikeImportance("medium")).toBe("Normal");
+    expect(wrikeImportance("low")).toBe("Low");
+  });
+});
+
+describe("wrike client", () => {
+  it("resolves numeric folder IDs, creates an undated task, and escapes content", async () => {
+    const calls: { url: URL; init: RequestInit }[] = [];
+    const fake = (async (url: URL, init: RequestInit) => {
+      calls.push({ url, init });
+      const body = url.pathname.endsWith("/ids")
+        ? { data: [{ id: "IEABFOLDER", apiV2Id: "4558110989" }] }
+        : { data: [{ id: "IEABTASK", permalink: "https://www.wrike.com/open.htm?id=1" }] };
+      return new Response(JSON.stringify(body), { status: 200 });
+    }) as unknown as typeof fetch;
+    const w = new WrikeClient({ token: "tok", host: "app-us2.wrike.com" }, fake);
+
+    const t = await w.createTask({
+      folderId: "4558110989",
+      title: "[abusive] Cohort 1: insult",
+      fields: [["Severity", "high"], ["Discord message", "https://discord.com/channels/1/2/3"]],
+      body: "<script>x</script>",
+      responsibleIds: ["KUAAA"],
+      importance: "High",
+    });
+    expect(t).toEqual({ id: "IEABTASK", permalink: "https://www.wrike.com/open.htm?id=1" });
+    expect(calls[0].url.toString()).toContain("app-us2.wrike.com/api/v4/ids");
+    expect(calls[1].url.pathname).toBe("/api/v4/folders/IEABFOLDER/tasks");
+    expect((calls[1].init.headers as any).authorization).toBe("bearer tok");
+    const form = calls[1].init.body as URLSearchParams;
+    expect(form.get("importance")).toBe("High");
+    expect(form.get("responsibles")).toBe('["KUAAA"]');
+    expect(form.get("dates")).toBeNull();
+    expect(form.get("description")).toContain("&lt;script&gt;");
+    expect(form.get("description")).toContain('<a href="https://discord.com/channels/1/2/3">');
+
+    await w.resolveFolderId("4558110989"); // cached, no new call
+    expect(calls).toHaveLength(2);
+  });
+
+  it("surfaces API errors", async () => {
+    const fake = (async () => new Response('{"error":"not_authorized"}', { status: 401 })) as unknown as typeof fetch;
+    const w = new WrikeClient({ token: "bad", host: "www.wrike.com" }, fake);
+    await expect(w.findContacts("a")).rejects.toThrow(/401/);
   });
 });

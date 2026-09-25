@@ -41,11 +41,11 @@ const schema = z.object({
   /** Fallback channel for alerts when a message's cohort has no alert channel. */
   FACILITATOR_ALERT_CHANNEL_ID: z.string().optional(),
 
-  // Microsoft Planner (Teams board) — optional
-  PLANNER_ENABLED: bool(false),
-  MS_TENANT_ID: z.string().optional(),
-  MS_CLIENT_ID: z.string().optional(),
-  MS_CLIENT_SECRET: z.string().optional(),
+  // Wrike tickets — optional
+  WRIKE_ENABLED: bool(false),
+  WRIKE_ACCESS_TOKEN: z.string().optional(),
+  /** API host for your Wrike data centre, e.g. www.wrike.com, app-us2.wrike.com, app-eu.wrike.com */
+  WRIKE_API_HOST: z.string().default("www.wrike.com"),
 });
 
 export type Config = z.infer<typeof schema>;
@@ -74,8 +74,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (cfg.TRIAGE_ENABLED && !cfg.ANTHROPIC_API_KEY) {
     throw new Error("TRIAGE_ENABLED=true requires ANTHROPIC_API_KEY");
   }
-  if (cfg.PLANNER_ENABLED && !(cfg.MS_TENANT_ID && cfg.MS_CLIENT_ID && cfg.MS_CLIENT_SECRET)) {
-    throw new Error("PLANNER_ENABLED=true requires MS_TENANT_ID, MS_CLIENT_ID and MS_CLIENT_SECRET");
+  if (cfg.WRIKE_ENABLED && !cfg.WRIKE_ACCESS_TOKEN) {
+    throw new Error("WRIKE_ENABLED=true requires WRIKE_ACCESS_TOKEN");
   }
   return cfg;
 }

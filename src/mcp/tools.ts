@@ -4,12 +4,14 @@ import type { Db } from "../db/pool.js";
 import * as d from "../discord/actions.js";
 import { destructiveActions, type DestructiveAction, type DiscordCtx } from "../discord/actions.js";
 import { firstRun, ScheduleError } from "../scheduler/schedule.js";
+import type { WrikeClient } from "../integrations/wrike.js";
 
 export interface ToolDeps {
   db: Db;
   ctx: DiscordCtx;
   requireApproval: boolean;
   defaultTimezone: string;
+  wrike?: WrikeClient;
   onTriageConfigChanged?: () => void;
 }
 
@@ -380,7 +382,8 @@ export function buildMcpServer(deps: ToolDeps): McpServer {
   tool(
     "upsert_cohort",
     "Create or update a cohort (matched by name): which channels/categories/roles belong to it, who its facilitators are, " +
-      "where alerts go, and which Planner plan/bucket/assignees get its tickets. Omitted fields keep their current value.",
+      "where alerts go, and which Wrike folder/assignees get its tickets. Omitted fields keep their current value. " +
+      "Use wrike_lookup to find Wrike folder and contact IDs.",
     {
       name: z.string().min(1).max(100),
       channel_ids: idList.optional(),
@@ -388,9 +391,8 @@ export function buildMcpServer(deps: ToolDeps): McpServer {
       role_ids: idList.optional(),
       facilitator_user_ids: idList.optional().describe("Discord user IDs to DM for alerts"),
       alert_channel_id: id.nullable().optional(),
-      planner_plan_id: z.string().nullable().optional(),
-      planner_bucket_id: z.string().nullable().optional(),
-      planner_assignee_ids: z.array(z.string()).optional().describe("Entra ID user object IDs"),
+      wrike_folder_id: z.string().nullable().optional().describe("Wrike API folder ID (or the numeric ID from a Wrike URL)"),
+      wrike_assignee_ids: z.array(z.string()).optional().describe("Wrike contact IDs"),
     },
     async (a) => {
       const cols = [
@@ -399,12 +401,12 @@ export function buildMcpServer(deps: ToolDeps): McpServer {
         "role_ids",
         "facilitator_user_ids",
         "alert_channel_id",
-        "planner_plan_id",
-        "planner_bucket_id",
-        "planner_assignee_ids",
+        "wrike_folder_id",
+        "wrike_assignee_ids",
       ] as const;
       const provided = cols.filter((c) => a[c] !== undefined);
       const insertCols = ["name", ...provided];
+      if (a.wrike_folder_id && deps.wrike) a.wrike_folder_id = await deps.wrike.resolveFolderId(a.wrike_folder_id);
       const values = [a.name, ...provided.map((c) => a[c])];
       const updates = provided.map((c) => `${c}=EXCLUDED.${c}`).concat("updated_at=now()").join(", ");
       const { rows } = await db.query(
@@ -418,6 +420,17 @@ export function buildMcpServer(deps: ToolDeps): McpServer {
   );
 
   tool("list_cohorts", "List cohorts and their routing.", {}, async () => (await db.query("SELECT * FROM cohorts ORDER BY name")).rows, RO);
+
+  tool(
+    "wrike_lookup",
+    "Find Wrike folder/project IDs or people (contact IDs) by name, for setting up a cohort's ticket routing.",
+    { kind: z.enum(["folders", "people"]), query: z.string().min(1) },
+    async (a) => {
+      if (!deps.wrike) throw new d.ToolError("Wrike is not enabled (set WRIKE_ENABLED and WRIKE_ACCESS_TOKEN).");
+      return a.kind === "folders" ? deps.wrike.findFolders(a.query) : deps.wrike.findContacts(a.query);
+    },
+    RO,
+  );
 
   tool(
     "delete_cohort",
@@ -496,7 +509,7 @@ export function buildMcpServer(deps: ToolDeps): McpServer {
       vals.push(a.limit ?? 100);
       const { rows } = await db.query(
         `SELECT e.id, e.category, e.severity, e.status, e.summary, e.excerpt, e.author_name, e.author_id,
-                e.channel_id, e.message_id, e.guild_id, c.name AS cohort, e.alerted, e.ticket_id, e.created_at,
+                e.channel_id, e.message_id, e.guild_id, c.name AS cohort, e.alerted, e.ticket_id, e.ticket_url, e.created_at,
                 'https://discord.com/channels/' || COALESCE(e.guild_id,'@me') || '/' || e.channel_id || '/' || e.message_id AS url
          FROM triage_events e LEFT JOIN cohorts c ON c.id = e.cohort_id
          ${where.length ? "WHERE " + where.join(" AND ") : ""}

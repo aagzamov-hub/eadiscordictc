@@ -25,9 +25,8 @@ CREATE TABLE IF NOT EXISTS cohorts (
   role_ids              TEXT[] NOT NULL DEFAULT '{}',
   facilitator_user_ids  TEXT[] NOT NULL DEFAULT '{}',   -- Discord user IDs to DM
   alert_channel_id      TEXT,                           -- private facilitator channel
-  planner_plan_id       TEXT,
-  planner_bucket_id     TEXT,
-  planner_assignee_ids  TEXT[] NOT NULL DEFAULT '{}',   -- Entra ID (Azure AD) user object IDs
+  wrike_folder_id       TEXT,                           -- Wrike folder/project that receives this cohort's tickets
+  wrike_assignee_ids    TEXT[] NOT NULL DEFAULT '{}',   -- Wrike contact IDs
   created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -64,6 +63,7 @@ CREATE TABLE IF NOT EXISTS triage_events (
   cohort_id        BIGINT REFERENCES cohorts(id) ON DELETE SET NULL,
   alerted          BOOLEAN NOT NULL DEFAULT FALSE,
   ticket_id        TEXT,
+  ticket_url       TEXT,
   status           TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','in_progress','resolved','dismissed')),
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );

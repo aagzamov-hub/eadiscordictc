@@ -9,7 +9,7 @@ import { createHttpApp } from "./http.js";
 import { startScheduler } from "./scheduler/runner.js";
 import { createAnthropicClassifier } from "./triage/classifier.js";
 import { createTriage } from "./triage/pipeline.js";
-import { PlannerClient } from "./integrations/planner.js";
+import { WrikeClient } from "./integrations/wrike.js";
 
 const cfg = loadConfig();
 const db = createPool(cfg.DATABASE_URL, cfg.DATABASE_SSL);
@@ -18,15 +18,15 @@ if (cfg.RUN_MIGRATIONS) await runMigrations(db);
 const client = createDiscordClient();
 const ctx: DiscordCtx = { client, allowedGuildIds: cfg.DISCORD_GUILD_IDS };
 
+const wrike = cfg.WRIKE_ENABLED ? new WrikeClient({ token: cfg.WRIKE_ACCESS_TOKEN!, host: cfg.WRIKE_API_HOST }) : undefined;
+
 let triage: ReturnType<typeof createTriage> | undefined;
 if (cfg.TRIAGE_ENABLED) {
   triage = createTriage({
     db,
     ctx,
     classify: createAnthropicClassifier(cfg.ANTHROPIC_API_KEY!, cfg.TRIAGE_MODEL),
-    planner: cfg.PLANNER_ENABLED
-      ? new PlannerClient({ tenantId: cfg.MS_TENANT_ID!, clientId: cfg.MS_CLIENT_ID!, clientSecret: cfg.MS_CLIENT_SECRET! })
-      : undefined,
+    wrike,
     minChars: cfg.TRIAGE_MIN_CHARS,
     concurrency: cfg.TRIAGE_CONCURRENCY,
     fallbackAlertChannelId: cfg.FACILITATOR_ALERT_CHANNEL_ID,
@@ -47,6 +47,7 @@ const app = createHttpApp({
       ctx,
       requireApproval: cfg.REQUIRE_APPROVAL,
       defaultTimezone: cfg.DEFAULT_TIMEZONE,
+      wrike,
       onTriageConfigChanged: () => triage?.invalidate(),
     }),
   health: async () => {

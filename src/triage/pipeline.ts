@@ -1,7 +1,7 @@
 import { EmbedBuilder, type Message } from "discord.js";
 import type { Db } from "../db/pool.js";
 import type { DiscordCtx } from "../discord/actions.js";
-import { PlannerClient, plannerPriority } from "../integrations/planner.js";
+import { WrikeClient, wrikeImportance } from "../integrations/wrike.js";
 import type { Category, Classification, Classifier } from "./classifier.js";
 import { shouldClassify } from "./prefilter.js";
 import { matchCohort, type CohortRow } from "./routing.js";
@@ -16,7 +16,7 @@ export interface TriageDeps {
   db: Db;
   ctx: DiscordCtx;
   classify: Classifier;
-  planner?: PlannerClient;
+  wrike?: WrikeClient;
   minChars: number;
   concurrency: number;
   fallbackAlertChannelId?: string;
@@ -107,21 +107,25 @@ export function createTriage(deps: TriageDeps) {
     if (category.alert_immediately || urgent) {
       await alert(msg, result, cohort, category, eventId);
     }
-    if (category.create_ticket && deps.planner && cohort?.planner_plan_id) {
+    if (category.create_ticket && deps.wrike && cohort?.wrike_folder_id) {
       try {
-        const task = await deps.planner.createTask({
-          planId: cohort.planner_plan_id,
-          bucketId: cohort.planner_bucket_id,
-          title: `[${result.category}] ${cohort.name}: ${result.summary}`,
-          description:
-            `Severity: ${result.severity}\nFrom: ${msg.member?.displayName ?? msg.author.username} in #${channelName}\n` +
-            `Message: ${msg.url}\n\n${msg.content.slice(0, 1500)}\n\nTriage event #${eventId}`,
-          assigneeIds: cohort.planner_assignee_ids,
-          priority: plannerPriority(result.severity),
+        const task = await deps.wrike.createTask({
+          folderId: cohort.wrike_folder_id,
+          title: `[${result.category.replace(/_/g, " ")}] ${cohort.name}: ${result.summary}`,
+          fields: [
+            ["Severity", result.severity],
+            ["From", msg.member?.displayName ?? msg.author.username],
+            ["Channel", `#${channelName}`],
+            ["Discord message", msg.url],
+            ["Triage event", `#${eventId}`],
+          ],
+          body: msg.content.slice(0, 1500),
+          responsibleIds: cohort.wrike_assignee_ids,
+          importance: wrikeImportance(result.severity),
         });
-        await deps.db.query("UPDATE triage_events SET ticket_id=$2 WHERE id=$1", [eventId, task.id]);
+        await deps.db.query("UPDATE triage_events SET ticket_id=$2, ticket_url=$3 WHERE id=$1", [eventId, task.id, task.permalink]);
       } catch (err) {
-        log.error(`planner task for event ${eventId} failed: ${(err as Error).message}`);
+        log.error(`wrike task for event ${eventId} failed: ${(err as Error).message}`);
       }
     }
   }

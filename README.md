@@ -4,14 +4,14 @@ A Discord bot plus an MCP server that lets an AI assistant (Claude, or a Copilot
 
 - **Management tools:** read and search messages, post and reply, create threads and channels, pin, react, DM, assign roles, time out members, and kick or ban. Destructive actions need approval.
 - **Scheduled messages:** one-off or recurring (cron). They are sent by the bot itself, so no chat session has to be open.
-- **24/7 AI triage:** every message is checked. Anything that needs a human is sorted into a category (abusive, urgent, technical/course/content support, or your own categories), matched to the right **cohort**, and sent to that cohort's facilitators. A **Microsoft Planner** task can also be created on the Teams board.
+- **24/7 AI triage:** every message is checked. Anything that needs a human is sorted into a category (abusive, urgent, technical/course/content support, or your own categories), matched to the right **cohort**, and sent to that cohort's facilitators. A **Wrike** task can also be opened for it.
 
 The bot runs as one Node process with Postgres. It has no host-specific code: the same Docker image runs on Railway now and on Platform.sh later.
 
 ```
 Discord ⇄ bot (discord.js) ─┬─ MCP endpoint /mcp  ⇄ Claude / Copilot Studio
                             ├─ scheduler (every 30s)
-                            ├─ triage → alerts (Discord channel / DMs) → Planner (Graph API)
+                            ├─ triage → alerts (Discord channel / DMs) → Wrike tasks (API v4)
                             └─ Postgres (schedules, cohorts, triage events, approvals, audit log)
 ```
 
@@ -86,14 +86,23 @@ Turn it on with `TRIAGE_ENABLED=true` and `ANTHROPIC_API_KEY`. **Try it on a tes
 4. **Discord AutoMod:** also turn on Discord's built-in AutoMod (Server Settings → AutoMod). It blocks slurs and spam before they're posted. This bot handles the judgment calls.
 5. **Tell members:** add a line to the server rules saying an AI assistant reviews messages so facilitators can help faster. Check your organization's policy on learner data before using this on the real server.
 
-## 8. Microsoft Planner tickets (Teams board)
+## 8. Wrike tickets
 
-This needs IT to create an **Entra ID app registration**:
+Categories with `create_ticket=true` can open a Wrike task in each cohort's folder or project. Each task gets:
+- a title like `[abusive] Cohort 3: summary`
+- **importance** from the severity (high/critical → High, medium → Normal, low → Low)
+- the assigned people as **assignees**
+- a description with the severity, author, channel, a link to the Discord message, and the message text
 
-- Application permission **`Tasks.ReadWrite.All`** (Microsoft Graph), with admin consent.
-- A client secret, then set `MS_TENANT_ID`, `MS_CLIENT_ID`, `MS_CLIENT_SECRET`, and `PLANNER_ENABLED=true`.
+No dates are set on these tasks. The task ID and link are saved on the triage event.
 
-For each cohort, set `planner_plan_id`, an optional `planner_bucket_id`, and `planner_assignee_ids` (Entra user object IDs). You can find a plan ID in the Planner URL, or ask IT. Categories with `create_ticket=true` then create a task. The title is `[category] Cohort: summary`, the priority comes from the severity, and the description includes the Discord link. Ask IT to confirm app-only Planner access is allowed in your tenant.
+**Before you turn this on, check with your Wrike admin.** The integration uses an API token, and Wrike admins can see and restrict API apps. For production, the token should belong to an account the admin approves, ideally a shared service account rather than your personal login.
+
+1. In Wrike, go to **Apps & Integrations → API**, create an app, and generate a **permanent access token**.
+2. Set `WRIKE_ENABLED=true`, `WRIKE_ACCESS_TOKEN`, and `WRIKE_API_HOST` (the host in your Wrike URL, e.g. `www.wrike.com` or `app-us2.wrike.com`).
+3. For each cohort, ask the assistant to set the folder and assignees. It uses `wrike_lookup` to find the IDs, e.g. "route Cohort 3 tickets to the AI Bootcamp folder, assigned to Sam." `wrike_folder_id` also accepts the numeric ID from a Wrike folder URL.
+
+The token acts as the Wrike user who created it, so tasks show as created by that user, and it can only reach folders that user can see.
 
 ## 9. Moving to company GitHub + Platform.sh
 

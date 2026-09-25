@@ -6,9 +6,8 @@ export interface CohortRow {
   role_ids: string[];
   facilitator_user_ids: string[];
   alert_channel_id: string | null;
-  planner_plan_id: string | null;
-  planner_bucket_id: string | null;
-  planner_assignee_ids: string[];
+  wrike_folder_id: string | null;
+  wrike_assignee_ids: string[];
 }
 
 export interface MessagePlace {
