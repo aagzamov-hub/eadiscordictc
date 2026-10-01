@@ -2,9 +2,13 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { Db } from "../db/pool.js";
 import * as d from "../discord/actions.js";
-import { destructiveActions, type DestructiveAction, type DiscordCtx } from "../discord/actions.js";
+import { destructiveActions, type DiscordCtx } from "../discord/actions.js";
 import { firstRun, ScheduleError } from "../scheduler/schedule.js";
 import type { WrikeClient } from "../integrations/wrike.js";
+import { isEmail, NUDGE_TEMPLATES, renderNudge, type Mailer } from "../integrations/email.js";
+import { checkMembership, parseRosterCsv, type RosterRow } from "../discord/membership.js";
+import { cohortStats, sendWeeklyRecaps } from "../reports/recap.js";
+import type { CohortRow } from "../triage/routing.js";
 
 export interface ToolDeps {
   db: Db;
@@ -12,6 +16,8 @@ export interface ToolDeps {
   requireApproval: boolean;
   defaultTimezone: string;
   wrike?: WrikeClient;
+  mailer?: Mailer;
+  programEmails?: string[];
   onTriageConfigChanged?: () => void;
 }
 
@@ -63,14 +69,46 @@ export function buildMcpServer(deps: ToolDeps): McpServer {
     );
   }
 
+  /** Learner data (rosters, email lists) never goes into the audit log, only its size. */
+  const redact = (params: any) => {
+    if (!params || typeof params !== "object") return params;
+    const out: any = { ...params };
+    for (const k of ["emails", "rows"]) if (Array.isArray(out[k])) out[k] = `[${out[k].length} redacted]`;
+    if (typeof out.csv === "string") out.csv = `[${out.csv.split("\n").length} lines redacted]`;
+    return out;
+  };
+
   async function audit(tool: string, params: unknown, success: boolean, error?: string) {
     await db
-      .query("INSERT INTO audit_log (tool, params, ok, error) VALUES ($1,$2,$3,$4)", [tool, params, success, error ?? null])
+      .query("INSERT INTO audit_log (tool, params, ok, error) VALUES ($1,$2,$3,$4)", [tool, redact(params), success, error ?? null])
       .catch(() => {});
   }
 
-  async function gate(action: DestructiveAction, params: any, summary: string) {
-    if (!deps.requireApproval) return destructiveActions[action](ctx, params);
+  // Everything that waits for approve_action. Learner emails always wait, even with REQUIRE_APPROVAL=false.
+  const executors: Record<string, (p: any) => Promise<unknown>> = {
+    ...Object.fromEntries(Object.entries(destructiveActions).map(([k, fn]) => [k, (p: any) => (fn as any)(ctx, p)])),
+    send_nudge_emails: async (p: { cohort_id: string; cohort: string; emails: string[]; subject: string; text: string; html: string }) => {
+      if (!deps.mailer) throw new d.ToolError("Email is not configured.");
+      const r = await deps.mailer.send({
+        kind: "nudge",
+        to: p.emails,
+        subject: p.subject,
+        text: p.text,
+        html: p.html,
+        cohortId: p.cohort_id,
+        individually: true,
+        logRecipients: false,
+      });
+      if (r.status === "failed") throw new Error(r.error ?? "send failed");
+      return { status: r.status, recipients: r.recipient_count, note: r.status === "preview" ? "Preview mode: no SendGrid key yet, nothing was sent." : undefined };
+    },
+  };
+  /** Learner addresses are removed from the pending action once it is resolved. */
+  const scrub = (action: string, params: any) =>
+    action === "send_nudge_emails" ? { cohort: params.cohort, recipients: params.emails?.length ?? 0, subject: params.subject } : params;
+
+  async function gate(action: string, params: any, summary: string, opts: { alwaysAsk?: boolean; preview?: unknown } = {}) {
+    if (!deps.requireApproval && !opts.alwaysAsk) return executors[action](params);
     const { rows } = await db.query<{ id: string }>(
       "INSERT INTO pending_actions (action, params, summary) VALUES ($1,$2,$3) RETURNING id",
       [action, params, summary],
@@ -79,6 +117,7 @@ export function buildMcpServer(deps: ToolDeps): McpServer {
       status: "pending_approval",
       pending_action_id: rows[0].id,
       summary,
+      ...(opts.preview ? { preview: opts.preview } : {}),
       next_step: "Show this to the user. Call approve_action with this ID only after they explicitly confirm.",
     };
   }
@@ -298,7 +337,7 @@ export function buildMcpServer(deps: ToolDeps): McpServer {
       const client = await db.connect();
       try {
         await client.query("BEGIN");
-        const { rows } = await client.query<{ action: DestructiveAction; params: any; status: string; summary: string }>(
+        const { rows } = await client.query<{ action: string; params: any; status: string; summary: string }>(
           "SELECT action, params, status, summary FROM pending_actions WHERE id=$1 FOR UPDATE",
           [a.pending_action_id],
         );
@@ -306,17 +345,21 @@ export function buildMcpServer(deps: ToolDeps): McpServer {
         if (!row) throw new d.ToolError("No such pending action.");
         if (row.status !== "pending") throw new d.ToolError(`Action is already ${row.status}.`);
         try {
-          const result = await destructiveActions[row.action](ctx, row.params);
-          await client.query("UPDATE pending_actions SET status='approved', result=$2, resolved_at=now() WHERE id=$1", [
+          const exec = executors[row.action];
+          if (!exec) throw new d.ToolError(`Unknown action ${row.action}.`);
+          const result = await exec(row.params);
+          await client.query("UPDATE pending_actions SET status='approved', result=$2, params=$3, resolved_at=now() WHERE id=$1", [
             a.pending_action_id,
             result,
+            scrub(row.action, row.params),
           ]);
           await client.query("COMMIT");
           return { done: row.summary, result };
         } catch (err) {
-          await client.query("UPDATE pending_actions SET status='failed', error=$2, resolved_at=now() WHERE id=$1", [
+          await client.query("UPDATE pending_actions SET status='failed', error=$2, params=$3, resolved_at=now() WHERE id=$1", [
             a.pending_action_id,
             (err as Error).message,
+            scrub(row.action, row.params),
           ]);
           await client.query("COMMIT");
           throw err;
@@ -336,11 +379,12 @@ export function buildMcpServer(deps: ToolDeps): McpServer {
     "Cancel a pending destructive action.",
     { pending_action_id: z.string().regex(/^\d+$/) },
     async (a) => {
-      const { rowCount } = await db.query(
-        "UPDATE pending_actions SET status='rejected', resolved_at=now() WHERE id=$1 AND status='pending'",
+      const { rows } = await db.query<{ action: string; params: any }>(
+        "UPDATE pending_actions SET status='rejected', resolved_at=now() WHERE id=$1 AND status='pending' RETURNING action, params",
         [a.pending_action_id],
       );
-      if (!rowCount) throw new d.ToolError("No pending action with that ID.");
+      if (!rows[0]) throw new d.ToolError("No pending action with that ID.");
+      await db.query("UPDATE pending_actions SET params=$2 WHERE id=$1", [a.pending_action_id, scrub(rows[0].action, rows[0].params)]);
       return { rejected: a.pending_action_id };
     },
   );
@@ -348,10 +392,12 @@ export function buildMcpServer(deps: ToolDeps): McpServer {
   // ---------------- Scheduling ----------------
   tool(
     "schedule_message",
-    "Schedule a message. One-off: send_at (ISO 8601 with offset). Recurring: cron (5 fields: minute hour day month weekday), " +
+    "Schedule a message. Target either one channel_id, or cohorts (names or codes, or [\"all\"]) to post in each cohort's " +
+      "announcement channel. One-off: send_at (ISO 8601 with offset). Recurring: cron (5 fields: minute hour day month weekday), " +
       `evaluated in timezone (default ${deps.defaultTimezone}). Example: every Monday 9am = "0 9 * * 1".`,
     {
-      channel_id: id,
+      channel_id: id.optional(),
+      cohorts: z.array(z.string()).optional().describe('cohort names/codes, or ["all"]'),
       content: z.string().min(1).max(2000),
       send_at: z.string().optional(),
       cron: z.string().optional(),
@@ -360,13 +406,27 @@ export function buildMcpServer(deps: ToolDeps): McpServer {
     async (a) => {
       const timezone = a.timezone ?? deps.defaultTimezone;
       const next = firstRun({ send_at: a.send_at, cron: a.cron, timezone });
-      await d.getTextChannel(ctx, a.channel_id); // fail fast if the channel is wrong
-      const { rows } = await db.query(
-        `INSERT INTO scheduled_messages (channel_id, content, cron, timezone, next_run_at, created_by)
-         VALUES ($1,$2,$3,$4,$5,'mcp') RETURNING id, next_run_at`,
-        [a.channel_id, a.content, a.cron ?? null, timezone, next],
-      );
-      return { id: rows[0].id, next_run_at: rows[0].next_run_at, recurring: !!a.cron, timezone };
+      if (!a.channel_id === !a.cohorts?.length) throw new d.ToolError("Give either channel_id or cohorts (not both).");
+      const targets: { channel_id: string; cohort?: string }[] = [];
+      if (a.channel_id) {
+        targets.push({ channel_id: a.channel_id });
+      } else {
+        const list = await findCohorts(a.cohorts!);
+        const missing = list.filter((c) => !c.announcement_channel_id).map((c) => c.name);
+        if (missing.length) throw new d.ToolError(`No announcement channel set for: ${missing.join(", ")}. Set it with upsert_cohort.`);
+        for (const c of list) targets.push({ channel_id: c.announcement_channel_id!, cohort: c.code ?? c.name });
+      }
+      for (const t of targets) await d.getTextChannel(ctx, t.channel_id); // fail fast if a channel is wrong
+      const created = [];
+      for (const t of targets) {
+        const { rows } = await db.query(
+          `INSERT INTO scheduled_messages (channel_id, content, cron, timezone, next_run_at, created_by)
+           VALUES ($1,$2,$3,$4,$5,'mcp') RETURNING id, next_run_at`,
+          [t.channel_id, a.content, a.cron ?? null, timezone, next],
+        );
+        created.push({ id: rows[0].id, cohort: t.cohort, channel_id: t.channel_id });
+      }
+      return { scheduled: created, next_run_at: next, recurring: !!a.cron, timezone };
     },
   );
 
@@ -403,6 +463,10 @@ export function buildMcpServer(deps: ToolDeps): McpServer {
       "Use wrike_lookup to find Wrike folder and contact IDs.",
     {
       name: z.string().min(1).max(100),
+      code: z.string().max(20).nullable().optional().describe("short label, e.g. C04 (also the Wrike Cohort value)"),
+      guild_id: id.nullable().optional().describe("the cohort's own Discord server, when each cohort has one"),
+      announcement_channel_id: id.nullable().optional().describe("where 'post to all cohorts' messages go"),
+      notify_emails: z.array(z.string()).optional().describe("staff emails for critical alerts and the weekly recap"),
       channel_ids: idList.optional(),
       category_ids: idList.optional(),
       role_ids: idList.optional(),
@@ -412,7 +476,16 @@ export function buildMcpServer(deps: ToolDeps): McpServer {
       wrike_assignee_ids: z.array(z.string()).optional().describe("Wrike contact IDs"),
     },
     async (a) => {
+      if (a.notify_emails) {
+        const bad = a.notify_emails.filter((e) => !isEmail(e));
+        if (bad.length) throw new d.ToolError(`Not valid email addresses: ${bad.join(", ")}`);
+        a.notify_emails = a.notify_emails.map((e) => e.trim().toLowerCase());
+      }
       const cols = [
+        "code",
+        "guild_id",
+        "announcement_channel_id",
+        "notify_emails",
         "channel_ids",
         "category_ids",
         "role_ids",
@@ -436,7 +509,13 @@ export function buildMcpServer(deps: ToolDeps): McpServer {
     },
   );
 
-  tool("list_cohorts", "List cohorts and their routing.", {}, async () => (await db.query("SELECT * FROM cohorts ORDER BY name")).rows, RO);
+  tool(
+    "list_cohorts",
+    "List cohorts and their routing.",
+    {},
+    async () => (await db.query("SELECT * FROM cohorts ORDER BY COALESCE(code, name)")).rows,
+    RO,
+  );
 
   tool(
     "wrike_lookup",
@@ -543,11 +622,209 @@ export function buildMcpServer(deps: ToolDeps): McpServer {
     "Change a triage event's status (e.g. mark resolved after a facilitator handled it).",
     { id: z.string().regex(/^\d+$/), status: z.enum(["open", "in_progress", "resolved", "dismissed"]) },
     async (a) => {
-      const { rowCount } = await db.query("UPDATE triage_events SET status=$2 WHERE id=$1", [a.id, a.status]);
-      if (!rowCount) throw new d.ToolError("No triage event with that ID.");
-      return { id: a.id, status: a.status };
+      const { rows } = await db.query<{ ticket_id: string | null }>(
+        `UPDATE triage_events SET status=$2, resolved_at = CASE WHEN $2 IN ('resolved','dismissed') THEN now() ELSE NULL END
+         WHERE id=$1 RETURNING ticket_id`,
+        [a.id, a.status],
+      );
+      if (!rows[0]) throw new d.ToolError("No triage event with that ID.");
+      let wrike: string | undefined;
+      if (a.status === "resolved" && rows[0].ticket_id && deps.wrike) {
+        await deps.wrike.completeTask(rows[0].ticket_id);
+        wrike = "Wrike task marked Completed";
+      }
+      return { id: a.id, status: a.status, wrike };
     },
   );
+
+  // ---------------- Hashtags ----------------
+  tool(
+    "list_hashtags",
+    "List the hashtags the agent reacts to in Discord and what each one does.",
+    {},
+    async () => (await db.query("SELECT * FROM hashtags ORDER BY action, tag")).rows,
+    RO,
+  );
+
+  tool(
+    "upsert_hashtag",
+    "Add or change a hashtag. action: ticket (raises a ticket in `category`), count (stats only), followup/escalate/resolve " +
+      "(staff-only, act on the replied-to message). min_severity sets the floor for tickets it raises.",
+    {
+      tag: z.string().regex(/^#?[a-z0-9][a-z0-9_-]{1,31}$/i),
+      action: z.enum(["ticket", "count", "followup", "escalate", "resolve"]),
+      category: z.string().nullable().optional(),
+      min_severity: z.enum(["low", "medium", "high", "critical"]).nullable().optional(),
+      staff_only: z.boolean().optional(),
+      description: z.string().max(200).optional(),
+    },
+    async (a) => {
+      const tag = a.tag.replace(/^#/, "").toLowerCase();
+      if (a.action === "ticket" && !a.category) throw new d.ToolError("A ticket hashtag needs a category (see list_triage_categories).");
+      if (a.category) {
+        const { rowCount } = await db.query("SELECT 1 FROM triage_categories WHERE name=$1", [a.category]);
+        if (!rowCount) throw new d.ToolError(`Unknown category ${a.category}.`);
+      }
+      const staff = a.staff_only ?? ["followup", "escalate", "resolve"].includes(a.action);
+      const { rows } = await db.query(
+        `INSERT INTO hashtags (tag, action, category, min_severity, staff_only, description) VALUES ($1,$2,$3,$4,$5,COALESCE($6,''))
+         ON CONFLICT (tag) DO UPDATE SET action=EXCLUDED.action, category=EXCLUDED.category, min_severity=EXCLUDED.min_severity,
+           staff_only=EXCLUDED.staff_only, description=COALESCE($6, hashtags.description) RETURNING *`,
+        [tag, a.action, a.category ?? null, a.min_severity ?? null, staff, a.description ?? null],
+      );
+      deps.onTriageConfigChanged?.();
+      return rows[0];
+    },
+  );
+
+  tool(
+    "delete_hashtag",
+    "Stop reacting to a hashtag (past counts are kept).",
+    { tag: z.string() },
+    async (a) => {
+      const { rowCount } = await db.query("DELETE FROM hashtags WHERE tag=$1", [a.tag.replace(/^#/, "").toLowerCase()]);
+      if (!rowCount) throw new d.ToolError("No such hashtag.");
+      deps.onTriageConfigChanged?.();
+      return { deleted: a.tag };
+    },
+  );
+
+  // ---------------- Stats, recap, email ----------------
+  tool(
+    "get_cohort_stats",
+    "Activity for one cohort (or all): flagged items by category and status, urgent/conduct count, resolved, still-open items, hashtag counts.",
+    { cohort: z.string().optional().describe("name or code; omit for all cohorts"), days: z.number().int().min(1).max(120).optional() },
+    async (a) => {
+      const since = new Date(Date.now() - (a.days ?? 7) * 864e5);
+      if (!a.cohort) return cohortStats(db, null, since);
+      const [c] = await findCohorts([a.cohort]);
+      return cohortStats(db, c, since);
+    },
+    RO,
+  );
+
+  tool(
+    "send_weekly_recap",
+    "Send the weekly recap email now (normally automatic on Mondays): to each cohort's notify_emails and, for all cohorts, " +
+      "the program-wide list. In preview mode (no SendGrid key) nothing is sent and the result says so.",
+    { cohorts: z.array(z.string()).optional().describe("names/codes; omit for all"), days: z.number().int().min(1).max(31).optional() },
+    async (a) => {
+      if (!deps.mailer) throw new d.ToolError("Email is not configured.");
+      const ids = a.cohorts?.length ? (await findCohorts(a.cohorts)).map((c) => c.id) : undefined;
+      const results = await sendWeeklyRecaps(db, deps.mailer, deps.programEmails ?? [], { cohortIds: ids, days: a.days });
+      return { preview_mode: deps.mailer.previewMode, results };
+    },
+  );
+
+  tool(
+    "list_email_log",
+    "Recent emails the agent sent or previewed (subjects and counts; learner addresses are never logged).",
+    { limit: z.number().int().min(1).max(200).optional() },
+    async (a) =>
+      (
+        await db.query(
+          `SELECT l.id, l.kind, l.subject, l.recipient_count, l.recipients, c.name AS cohort, l.status, l.error, l.created_at
+           FROM email_log l LEFT JOIN cohorts c ON c.id=l.cohort_id ORDER BY l.id DESC LIMIT $1`,
+          [a.limit ?? 50],
+        )
+      ).rows,
+    RO,
+  );
+
+  // ---------------- Discord join check (de-identified roster) ----------------
+  tool(
+    "check_discord_membership",
+    "Compare a cohort's de-identified roster (email + Discord username, e.g. from an LMS CSV export) with who is in the " +
+      "cohort's Discord server. Returns joined / not_joined / needs_review. Give `rows` or paste the CSV text in `csv`. " +
+      "The roster is used for this check only and is not stored.",
+    {
+      cohort: z.string().describe("cohort name or code"),
+      rows: z.array(z.object({ email: z.string(), discord_username: z.string() })).max(2000).optional(),
+      csv: z.string().max(500_000).optional().describe("CSV text with a header row: an email column and a Discord username column"),
+    },
+    async (a) => {
+      const [c] = await findCohorts([a.cohort]);
+      if (!c.guild_id) throw new d.ToolError(`${c.name} has no Discord server set (upsert_cohort guild_id).`);
+      let rows: RosterRow[] = a.rows ?? [];
+      if (a.csv) {
+        try {
+          rows = rows.concat(parseRosterCsv(a.csv));
+        } catch (err) {
+          throw new d.ToolError((err as Error).message);
+        }
+      }
+      if (!rows.length) throw new d.ToolError("No roster rows given.");
+      const guild = await d.getGuild(ctx, c.guild_id);
+      const report = await checkMembership(guild, rows);
+      return {
+        cohort: c.code ?? c.name,
+        summary: `${report.joined.length} of ${report.total} joined · ${report.not_joined.length} not joined · ${report.needs_review.length} need a look`,
+        ...report,
+        next_step: report.not_joined.length
+          ? "Offer to send a nudge email to the not_joined learners with send_nudge_emails (it asks for approval first)."
+          : undefined,
+      };
+    },
+    RO,
+  );
+
+  tool(
+    "send_nudge_emails",
+    "Email learners who haven't joined their cohort's Discord, reminding them to use the link in their course Introduction. " +
+      "Always waits for approval: returns a preview and a pending action ID; call approve_action only after the user confirms. " +
+      "template 'first' (friendly) or 'second' (reminder); subject/body override the template ({cohort} and {link} are filled in).",
+    {
+      cohort: z.string(),
+      emails: z.array(z.string()).min(1).max(1000),
+      template: z.enum(["first", "second"]).optional(),
+      subject: z.string().max(200).optional(),
+      body: z.string().max(5000).optional(),
+      join_link: z.string().url().optional().describe("optional direct Discord invite to include"),
+    },
+    async (a) => {
+      if (!deps.mailer) throw new d.ToolError("Email is not configured.");
+      const [c] = await findCohorts([a.cohort]);
+      const cleaned = a.emails.map((e) => e.trim().toLowerCase());
+      const valid = [...new Set(cleaned.filter(isEmail))];
+      const invalid = cleaned.filter((e) => !isEmail(e)).length;
+      if (!valid.length) throw new d.ToolError("No valid email addresses.");
+      const base = NUDGE_TEMPLATES[a.template ?? "first"];
+      const rendered = renderNudge({ subject: a.subject ?? base.subject, body: a.body ?? base.body }, c.code ? `${c.name} (${c.code})` : c.name, a.join_link);
+      return gate(
+        "send_nudge_emails",
+        { cohort_id: c.id, cohort: c.name, emails: valid, ...rendered },
+        `Email ${valid.length} learner(s) in ${c.name}: "${rendered.subject}"`,
+        {
+          alwaysAsk: true,
+          preview: {
+            subject: rendered.subject,
+            body: rendered.text,
+            recipients: valid.length,
+            skipped_invalid: invalid,
+            duplicates_removed: cleaned.length - invalid - valid.length,
+            mode: deps.mailer.previewMode ? "preview only: no SendGrid key yet, nothing will actually be sent" : "live",
+          },
+        },
+      );
+    },
+  );
+
+  /** Resolves cohort names/codes (case-insensitive), or ["all"]. */
+  async function findCohorts(keys: string[]): Promise<CohortRow[]> {
+    const { rows } = await db.query<CohortRow>("SELECT * FROM cohorts ORDER BY COALESCE(code, name)");
+    if (keys.length === 1 && keys[0].toLowerCase() === "all") {
+      if (!rows.length) throw new d.ToolError("No cohorts set up yet.");
+      return rows;
+    }
+    const out: CohortRow[] = [];
+    for (const k of keys) {
+      const key = k.trim().toLowerCase();
+      const hit = rows.find((c) => c.name.toLowerCase() === key || (c.code ?? "").toLowerCase() === key);
+      if (!hit) throw new d.ToolError(`Unknown cohort "${k}". Known: ${rows.map((c) => c.code ?? c.name).join(", ") || "none"}.`);
+      if (!out.includes(hit)) out.push(hit);
+    }
+    return out;
+  }
 
   return server;
 }

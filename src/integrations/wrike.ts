@@ -19,6 +19,13 @@ export interface WrikeTaskInput {
   body: string;
   responsibleIds: string[];
   importance: "High" | "Normal" | "Low";
+  /** Wrike custom field values, by field ID. */
+  customFields?: { id: string; value: string }[];
+}
+
+export interface WrikeTaskStatus {
+  id: string;
+  status: "Active" | "Completed" | "Deferred" | "Cancelled" | string;
 }
 
 const escapeHtml = (s: string) =>
@@ -71,9 +78,32 @@ export class WrikeClient {
       importance: input.importance,
     };
     if (input.responsibleIds.length) params.responsibles = JSON.stringify(input.responsibleIds);
+    const custom = (input.customFields ?? []).filter((f) => f.id && f.value);
+    if (custom.length) params.customFields = JSON.stringify(custom);
     // No dates are set on purpose: tickets stay undated unless someone schedules them.
     const res = await this.call<{ data: { id: string; permalink: string }[] }>("POST", `/folders/${folderId}/tasks`, params);
     return { id: res.data[0].id, permalink: res.data[0].permalink };
+  }
+
+  /** Adds a comment to a task (used when a conversation continues in the same thread). */
+  async addComment(taskId: string, text: string): Promise<void> {
+    await this.call("POST", `/tasks/${taskId}/comments`, { text: escapeHtml(text).replace(/\n/g, "<br>") });
+  }
+
+  /** Status group of up to 100 tasks per call. */
+  async getTaskStatuses(ids: string[]): Promise<WrikeTaskStatus[]> {
+    const out: WrikeTaskStatus[] = [];
+    for (let i = 0; i < ids.length; i += 100) {
+      const chunk = ids.slice(i, i + 100);
+      const res = await this.call<{ data: { id: string; status: string }[] }>("GET", `/tasks/${chunk.join(",")}`);
+      out.push(...res.data.map((t) => ({ id: t.id, status: t.status })));
+    }
+    return out;
+  }
+
+  /** Marks a task Completed (when a facilitator resolves it from Discord). */
+  async completeTask(taskId: string): Promise<void> {
+    await this.call("PUT", `/tasks/${taskId}`, { status: "Completed" });
   }
 
   /** Folders/projects whose title contains the query (case-insensitive). */
@@ -106,4 +136,18 @@ function linkify(v: string): string {
 
 export function wrikeImportance(severity: string): "High" | "Normal" | "Low" {
   return severity === "critical" || severity === "high" ? "High" : severity === "low" ? "Low" : "Normal";
+}
+
+/** Value for the Wrike "Ticket type" field, from the triage category. */
+export function wrikeTicketType(category: string): string {
+  return (
+    {
+      abusive: "Urgent",
+      urgent: "Urgent",
+      technical_support: "Tech",
+      course_support: "Support",
+      content_support: "Content",
+      follow_up: "Follow-up",
+    }[category] ?? "Support"
+  );
 }

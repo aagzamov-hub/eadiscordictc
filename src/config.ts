@@ -46,6 +46,26 @@ const schema = z.object({
   WRIKE_ACCESS_TOKEN: z.string().optional(),
   /** API host for your Wrike data centre, e.g. www.wrike.com, app-us2.wrike.com, app-eu.wrike.com */
   WRIKE_API_HOST: z.string().default("www.wrike.com"),
+  /** Optional Wrike custom field IDs, filled on every ticket when set. */
+  WRIKE_FIELD_COHORT: z.string().optional(),
+  WRIKE_FIELD_TICKET_TYPE: z.string().optional(),
+  WRIKE_FIELD_SOURCE_TAG: z.string().optional(),
+  /** How often to pull ticket status back from Wrike (Done in Wrike → resolved here). */
+  WRIKE_SYNC_MINUTES: z.coerce.number().int().min(1).default(10),
+
+  // Hashtags & engagement
+  /** Store which learner used which hashtag (per-learner engagement). Off = cohort-level counts only. */
+  TRACK_LEARNER_ACTIVITY: bool(false),
+
+  // Email (SendGrid). Without SENDGRID_API_KEY every email is a preview: rendered and logged, never sent.
+  SENDGRID_API_KEY: z.string().optional(),
+  EMAIL_FROM: z.string().optional(),
+  EMAIL_FROM_NAME: z.string().default("eLearning Pathways"),
+  /** Program-wide recipients: critical alerts for every cohort + the all-cohorts weekly recap. */
+  PROGRAM_EMAILS: csv,
+  /** When the weekly recap goes out (cron, DEFAULT_TIMEZONE). Default Monday 8:00. */
+  RECAP_CRON: z.string().default("0 8 * * 1"),
+  RECAP_ENABLED: bool(true),
 });
 
 export type Config = z.infer<typeof schema>;
@@ -76,6 +96,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   if (cfg.WRIKE_ENABLED && !cfg.WRIKE_ACCESS_TOKEN) {
     throw new Error("WRIKE_ENABLED=true requires WRIKE_ACCESS_TOKEN");
+  }
+  if (cfg.SENDGRID_API_KEY && !cfg.EMAIL_FROM) {
+    throw new Error("SENDGRID_API_KEY requires EMAIL_FROM (a SendGrid-verified sender address)");
   }
   return cfg;
 }

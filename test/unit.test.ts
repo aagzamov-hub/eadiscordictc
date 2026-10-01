@@ -51,17 +51,25 @@ describe("schedule", () => {
 });
 
 describe("cohort routing", () => {
-  const base = { facilitator_user_ids: [], alert_channel_id: null, wrike_folder_id: null, wrike_assignee_ids: [] };
+  const base = { code: null, guild_id: null, facilitator_user_ids: [], alert_channel_id: null, announcement_channel_id: null, notify_emails: [], wrike_folder_id: null, wrike_assignee_ids: [] };
   const cohorts: CohortRow[] = [
     { ...base, id: "1", name: "C1", channel_ids: ["100"], category_ids: [], role_ids: ["r1"] },
     { ...base, id: "2", name: "C2", channel_ids: [], category_ids: ["900"], role_ids: [] },
   ];
   it("prefers exact channel, then thread parent, then category, then role", () => {
-    expect(matchCohort(cohorts, { channelId: "100", parentChannelId: null, categoryId: "900", authorRoleIds: [] })?.name).toBe("C1");
-    expect(matchCohort(cohorts, { channelId: "t1", parentChannelId: "100", categoryId: "900", authorRoleIds: [] })?.name).toBe("C1");
-    expect(matchCohort(cohorts, { channelId: "200", parentChannelId: null, categoryId: "900", authorRoleIds: [] })?.name).toBe("C2");
-    expect(matchCohort(cohorts, { channelId: "300", parentChannelId: null, categoryId: null, authorRoleIds: ["r1"] })?.name).toBe("C1");
-    expect(matchCohort(cohorts, { channelId: "300", parentChannelId: null, categoryId: null, authorRoleIds: [] })).toBeNull();
+    expect(matchCohort(cohorts, { guildId: null, channelId: "100", parentChannelId: null, categoryId: "900", authorRoleIds: [] })?.name).toBe("C1");
+    expect(matchCohort(cohorts, { guildId: null, channelId: "t1", parentChannelId: "100", categoryId: "900", authorRoleIds: [] })?.name).toBe("C1");
+    expect(matchCohort(cohorts, { guildId: null, channelId: "200", parentChannelId: null, categoryId: "900", authorRoleIds: [] })?.name).toBe("C2");
+    expect(matchCohort(cohorts, { guildId: null, channelId: "300", parentChannelId: null, categoryId: null, authorRoleIds: ["r1"] })?.name).toBe("C1");
+    expect(matchCohort(cohorts, { guildId: null, channelId: "300", parentChannelId: null, categoryId: null, authorRoleIds: [] })).toBeNull();
+  });
+  it("falls back to the whole server when each cohort has its own", () => {
+    const servers: CohortRow[] = [
+      { ...base, id: "7", name: "Cohort 07", guild_id: "g7", channel_ids: [], category_ids: [], role_ids: [] },
+      { ...base, id: "8", name: "Cohort 08", guild_id: "g8", channel_ids: [], category_ids: [], role_ids: [] },
+    ];
+    expect(matchCohort(servers, { guildId: "g8", channelId: "any", parentChannelId: null, categoryId: null, authorRoleIds: [] })?.name).toBe("Cohort 08");
+    expect(matchCohort(servers, { guildId: "g9", channelId: "any", parentChannelId: null, categoryId: null, authorRoleIds: [] })).toBeNull();
   });
 });
 

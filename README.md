@@ -104,7 +104,47 @@ No dates are set on these tasks. The task ID and link are saved on the triage ev
 
 The token acts as the Wrike user who created it, so tasks show as created by that user, and it can only reach folders that user can see.
 
-## 9. Moving to company GitHub + Platform.sh
+## 9. Cohorts as servers, scheduling to many cohorts
+
+Each cohort can be its own Discord server. Set it up from chat:
+
+> "Set up Cohort 04: code C04, server 1234…, announcements channel 5678…, staff emails fac4@…, facilitator @Amy, Wrike folder 4558…"
+
+Messages anywhere in that server are routed to the cohort. Scheduling can target cohorts instead of a channel: "every Monday 9am post the weekly check-in in **all** cohorts" creates one scheduled post per cohort's announcements channel, each one cancellable on its own.
+
+## 10. Hashtags
+
+Learners and staff can type hashtags in any message. They work even with AI triage off; manage them with `list_hashtags` / `upsert_hashtag`.
+
+| Tag | Effect |
+|---|---|
+| `#urgent` `#blocker` | Ticket, high severity, alert + email |
+| `#help` `#question` `#tech` `#content` | Ticket in the matching category |
+| `#win` `#capstone` `#resource` `#feedback` `#week1`…`#week14` | Counted for stats and the weekly recap |
+| `#followup` `#escalate` `#resolved` | **Staff only**, used when replying to a message: follow-up ticket, escalation, or close the ticket (and its Wrike task) |
+
+- With AI triage on, a learner's tag is a strong hint, but obvious misuse (e.g. `#urgent` on small talk) is downgraded.
+- Untagged messages are still caught by the AI.
+- One conversation means one ticket: later messages in the same thread become comments on the Wrike task.
+- The bot reacts ✅ when it picks something up.
+- Per-learner hashtag history is only stored with `TRACK_LEARNER_ACTIVITY=true`. Otherwise counts are cohort-level.
+
+## 11. Email: critical alerts, weekly recap, join nudges
+
+Email goes through SendGrid. **Without `SENDGRID_API_KEY` everything is a preview:** emails are rendered and logged (`list_email_log`), never sent.
+
+- **Critical alerts:** high/critical items email the cohort's `notify_emails` plus `PROGRAM_EMAILS`.
+- **Weekly recap:** sent every Monday 8:00 (`RECAP_CRON`), or on demand with `send_weekly_recap`. Each cohort's staff get their cohort; `PROGRAM_EMAILS` get all cohorts. It covers flagged items by category, urgent/conduct items, items resolved, what's still open (with Wrike links), and hashtag counts.
+- **Discord join check:** export a de-identified CSV from the LMS (`email, discord_username`), drop it in the chat, and ask "who in C04 hasn't joined Discord?". `check_discord_membership` returns three lists: joined, not joined, and needs a look (typos, display names, duplicates).
+- **Nudges:** `send_nudge_emails` always waits for approval, even with `REQUIRE_APPROVAL=false`, and shows the exact email first. It sends one email per learner, so no one sees other addresses.
+- **What's stored:** learner addresses are never stored. They're removed from the pending action once it's approved or rejected, redacted from the audit log, and not written to the email log.
+
+## 12. Wrike ticket board
+
+- **Custom fields:** if the board has **Cohort**, **Ticket type** and **Source tag** custom fields, put their IDs in `WRIKE_FIELD_COHORT`, `WRIKE_FIELD_TICKET_TYPE` and `WRIKE_FIELD_SOURCE_TAG`, and every ticket is filled in.
+- **Two-way sync:** completing a task in Wrike resolves it in the agent (checked every `WRIKE_SYNC_MINUTES`), and `#resolved` in Discord completes the Wrike task.
+
+## 13. Moving to company GitHub + Platform.sh
 
 1. **Code:** transfer this repo to the company org (GitHub → Settings → Transfer), or push it to a new company repo. Both keep the history.
 2. **Discord:** create a **production** bot app under a company-owned account and don't reuse the dev token.
